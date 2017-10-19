@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# bin/detect <build-dir>
+
+echo "hello detect"
+
+if [ -n "$(find $1 -maxdepth 5 -iname Progrm.cs)" ]; then
+  echo ".NET Core" && exit 0
+else
+  echo "no" && exit 1
+fi

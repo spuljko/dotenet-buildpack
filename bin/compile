@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir>
+
+# fail fast
+set -e
+echo "Starting compile..."
+if [ $STACK != "cedar-14" ]; then
+	echo "Stack ${STACK} not supported" && exit 1
+fi
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+# This is where the buildpack is stored
+BUILDPACK_DIR=`cd $(dirname $0); cd ..; pwd`
+
+source $BUILDPACK_DIR/bin/util
+
+export_env_dir ${ENV_DIR}
+
+: ${CORE_VERSION:="latest"}
+: ${CORE_SCRIPT_LOCATION:="https://raw.githubusercontent.com/dotnet/cli/rel/1.0.0/scripts/obtain/dotnet-install.sh"}
+: ${NODE_VERSION:="4.4.4"}
+: ${CORE_VERSION:="latest"}
+: ${CORE_CHANNEL:="preview"}
+
+if [ -n "$BUILD_DEBUG" ]; then
+	CORE_CONFIGURATION="Debug"
+	CORE_ENVIRONMENT="--environment Development"
+else
+	CORE_CONFIGURATION="Release"
+	CORE_ENVIRONMENT=""
+fi
+
+SRC_DIR=`mktemp -d`
+# Move the app source code into temporary src dir using subshell to not leak shopt
+(
+	shopt -s dotglob
+	mv ${BUILD_DIR}/* ${SRC_DIR}
+)
+
+mkdir -p ${CACHE_DIR}
+
+# TODO: This test doesn't seen to actually work
+# TODO: Maybe just run `npm install -g` and if anything is missing, install it after
+if [[ -n $(find ${SRC_DIR} -type f -iname package.json -o -iname bower.json) ]]
+then
+	echo "Installing Node"
+	NODE_PATH=`mktemp -d`
+	curl https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz -Ls \
+		| tar xz -C ${NODE_PATH}
+	export PATH="${NODE_PATH}/node-v${NODE_VERSION}-linux-x64/bin:${PATH}"
+	echo "Installing bower"
+	if ! hash bower 2>/dev/null; then
+		npm install -g bower
+	fi
+fi
+
+# Install .NET Core
+echo "Get .NET Core Version and Channel from the PROJECT"
+DEPLOYMENT_FILE_LOCATION=${SRC_DIR}/.deployment
+if [ -n "$(find ${SRC_DIR}/global.json)" ]; then
+	echo "Get version from global.json"
+	CORE_VERSION=$(ruby -rjson -e "j = JSON.parse(File.open('${SRC_DIR}/global.json','r:bom|utf-8').read); unless j['sdk'].nil? ; puts j['sdk']['version'];end")
+	if [ -z "${CORE_VERSION}" ]; then
+		CORE_VERSION="latest"
+	elif [[ "${CORE_VERSION}" != "latest" ]]; then
+		if [[ "${CORE_VERSION}" == "1.0.0-preview2.1-003155" ]]; then
+			CORE_DOWNLOAD_LOCATION="https://dotnetcli.blob.core.windows.net/dotnet/preview/Binaries/1.0.0-preview2.1-003155/dotnet-dev-ubuntu-x64.1.0.0-preview2.1-003155.tar.gz"
+		elif [[ "${CORE_VERSION}" > "1.0.0-preview2-003121" ]]; then
+			#TODO
+			CORE_DOWNLOAD_LOCATION="https://dotnetcli.blob.core.windows.net/dotnet/Sdk/rel-1.0.0/dotnet-dev-ubuntu-x64.latest.tar.gz"
+		elif [[ ! "${CORE_VERSION}" > "1.0.0-preview1-002702" ]]; then
+			CORE_CHANNEL="beta"
+		fi
+	fi
+fi
+
+if [[ "${CORE_VERSION}" == "latest" && -e "${DEPLOYMENT_FILE_LOCATION}" ]]; then
+	CORE_CHANNEL_TMP=$(awk -F "=" '/channel/ {print $2}' ${DEPLOYMENT_FILE_LOCATION} | tr -d ' ')
+	if [ ! -z "${CORE_CHANNEL_TMP}" ]; then
+		CORE_CHANNEL="${CORE_CHANNEL_TMP}"
+	fi
+fi
+
+# Temporary fix noliar/dotnet-buildpack#8
+if [[ "${CORE_VERSION}" == "latest" && "${CORE_CHANNEL}" == "preview" ]]; then
+	CORE_VERSION="1.0.0-preview2-003121"
+fi
+
+CORE_VERSION_FIRST="$CORE_VERSION"
+echo "hello compile"
+
+if [[ "${CORE_VERSION}" == "latest" ]]; then
+	CORE_VERSION_FIRST="Latest"
+fi
+
+: ${CORE_DOWNLOAD_LOCATION:="https://dotnetcli.blob.core.windows.net/dotnet/${CORE_CHANNEL}/Binaries/${CORE_VERSION_FIRST}/dotnet-dev-ubuntu-x64.${CORE_VERSION}.tar.gz"}
+
+echo "Installing the dependencies"
+apt_install libunwind8 gettext
+
+mkdir -p ${BUILD_DIR}/dotnet
+
+echo "Installing .NET CORE ${CORE_VERSION} from ${CORE_DOWNLOAD_LOCATION}"
+# dotnet-install.sh using `ldconfig` which search pkg in `/lib` or `/usr/lib`. So I change it to binaries.
+#curl -sSL ${CORE_SCRIPT_LOCATION} | bash /dev/stdin --version ${CORE_VERSION} --install-dir ${BUILD_DIR}/dotnet
+curl ${CORE_DOWNLOAD_LOCATION} -Ls | tar xz -C ${BUILD_DIR}/dotnet
+ln -s ${BUILD_DIR}/dotnet /app
+
+export PATH="/app/dotnet:${PATH}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
+
+if [ -n "$PROJECT" ]; then
+	PROJECT_JSON_FILE=${SRC_DIR}/${PROJECT}
+	echo "Project file configured in PROJECT environment variable"
+elif [ -e ${DEPLOYMENT_FILE_LOCATION} ]; then
+	PROJECT_JSON_FILE=${SRC_DIR}/$(awk -F "=" '/project/ {print $2}' ${DEPLOYMENT_FILE_LOCATION} | tr -d ' ')
+	echo "Project file configured in .deployment file"
+else
+	PROJECT_JSON_FILES=$(find ${SRC_DIR}/. -maxdepth 5 -iname "project.json")
+	printf 'Found %s project.json files\n' $(echo "$PROJECT_JSON_FILES" | wc -l | tr -d ' ')
+	PROJECT_JSON_FILE=$(echo "$PROJECT_JSON_FILES" | head -1)
+	PROJECT_JSON_FILE=$(readlink -m $PROJECT_JSON_FILE)
+fi
+echo "Building ${PROJECT_JSON_FILE}"
+
+PROJECT_DIR="$PROJECT_JSON_FILE"
+if [[ -f $PROJECT_JSON_FILE ]]; then
+	PROJECT_DIR=$(dirname $PROJECT_JSON_FILE)
+fi
+
+echo "Reading App Name from project.json"
+PROJECT_DIR_NAME=$(basename $PROJECT_DIR)
+PROJECT_NAME=$(ruby -rjson -e "j = JSON.parse(File.open('${PROJECT_DIR}/project.json','r:bom|utf-8').read); unless j['buildOptions'].nil? ; puts j['buildOptions']['outputName'];end")
+echo "${PROJECT_NAME:=$PROJECT_DIR_NAME}"
+
+echo "Restoring the packages"
+dotnet restore ${SRC_DIR}
+
+# configure some npm command during building
+export PATH="${PROJECT_DIR}/node_modules/.bin:${PATH}"
+
+echo "Publishing the app"
+# Publish to heroku_output
+dotnet publish ${PROJECT_JSON_FILE} --output ${BUILD_DIR}/heroku_output --configuration ${CORE_CONFIGURATION}
+
+echo "Publish Successed"
+
+mkdir -p ${BUILD_DIR}/.profile.d
+cp -n ${BUILDPACK_DIR}/.profile.d/* ${BUILD_DIR}/.profile.d/
+
+if [ -e ${SRC_DIR}/Procfile ]; then
+	cp ${SRC_DIR}/Procfile ${BUILD_DIR}
+else
+	cat << EOT >> ${BUILD_DIR}/Procfile
+web: cd \$HOME/heroku_output && dotnet ./${PROJECT_NAME}.dll --server.urls http://+:\$PORT ${CORE_ENVIRONMENT}
+EOT
+fi
